@@ -295,14 +295,16 @@ func TestCacheWatcherStoppedOnDestroy(t *testing.T) {
 
 func TestResourceVersionAfterInitEvents(t *testing.T) {
 	const numObjects = 10
-	store := store.NewIndexer(nil)
+	store := store.NewWatchCacheStorage(nil)
 
 	for i := 0; i < numObjects; i++ {
 		elem := makeTestStoreElement(makeTestPod(fmt.Sprintf("pod-%d", i), uint64(i)))
-		store.Add(elem)
+		if _, err := store.UpdateStore(watch.Added, elem, uint64(i)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	wci, err := newCacheIntervalFromStore(numObjects, store, "", false)
+	wci, err := newCacheIntervalFromStore(numObjects, store.LatestSnapshot(), "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

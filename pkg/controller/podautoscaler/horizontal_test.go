@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	goruntime "runtime"
 	"strings"
 	"sync"
@@ -47,6 +48,7 @@ import (
 	core "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	consistencyutil "k8s.io/client-go/util/consistency"
 	"k8s.io/client-go/util/workqueue"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	metricstestutil "k8s.io/component-base/metrics/testutil"
@@ -55,7 +57,6 @@ import (
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/podautoscaler/metrics"
 	"k8s.io/kubernetes/pkg/controller/podautoscaler/monitor"
-	consistencyutil "k8s.io/kubernetes/pkg/controller/util/consistency"
 	"k8s.io/kubernetes/pkg/controller/util/selectors"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/utils/ktesting"
@@ -3414,6 +3415,37 @@ func TestReplicaLimits(t *testing.T) {
 			}, scaledToZeroFalse),
 		},
 		{
+			// Each pod requests 1000m and reports 15,000,000,000m, so utilization is
+			// 1,500,000,000% (still within int32) against a 1% target: a usage ratio of 1.5e9
+			// that asks for 4.5e9 replicas, beyond int32. The saturated proposal must be clamped
+			// by the normal limits down to maxReplicas rather than wrapping negative and
+			// collapsing to minReplicas.
+			name: "upscale with overflowing replica calculation clamped to max replicas",
+			fixture: horizontalScenario{
+				minReplicas:         1,
+				maxReplicas:         10,
+				specReplicas:        3,
+				statusReplicas:      3,
+				scaleUpRules:        generateScalingRules(0, 0, 700, 60, 0),
+				CPUTarget:           1,
+				reportedLevels:      []uint64{15_000_000_000, 15_000_000_000, 15_000_000_000},
+				reportedCPURequests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+				resource: &fakeResource{
+					name:       "test-rc",
+					apiVersion: "v1",
+					kind:       "ReplicationController",
+				},
+			},
+			expectedDesiredReplicas: 10,
+			expectedScaleUpdated:    true,
+			expectedActionLabel:     monitor.ActionLabelScaleUp,
+			expectedConditions: statusOkWithOverrides(autoscalingv2.HorizontalPodAutoscalerCondition{
+				Type:   autoscalingv2.ScalingLimited,
+				Status: v1.ConditionTrue,
+				Reason: "TooManyReplicas",
+			}, scaledToZeroFalse),
+		},
+		{
 			name: "scale down to max immediately even with recent scale time",
 			fixture: horizontalScenario{
 				minReplicas:         2,
@@ -5030,25 +5062,66 @@ func TestConvertDesiredReplicasWithRules(t *testing.T) {
 }
 
 func TestCalculateScaleUpLimitWithScalingRules(t *testing.T) {
-	policy := autoscalingv2.MinChangePolicySelect
-
-	calculated := calculateScaleUpLimitWithScalingRules(1, []timestampedScaleEvent{}, []timestampedScaleEvent{}, &autoscalingv2.HPAScalingRules{
-		StabilizationWindowSeconds: new(int32(300)),
-		SelectPolicy:               &policy,
-		Policies: []autoscalingv2.HPAScalingPolicy{
-			{
-				Type:          autoscalingv2.PodsScalingPolicy,
-				Value:         2,
-				PeriodSeconds: 60,
+	tests := []struct {
+		name             string
+		currentReplicas  int32
+		selectPolicy     autoscalingv2.ScalingPolicySelect
+		policies         []autoscalingv2.HPAScalingPolicy
+		expectedReplicas int32
+	}{
+		{
+			name:            "min policy selects the smaller change",
+			currentReplicas: 1,
+			selectPolicy:    autoscalingv2.MinChangePolicySelect,
+			policies: []autoscalingv2.HPAScalingPolicy{
+				{Type: autoscalingv2.PodsScalingPolicy, Value: 2, PeriodSeconds: 60},
+				{Type: autoscalingv2.PercentScalingPolicy, Value: 50, PeriodSeconds: 60},
 			},
-			{
-				Type:          autoscalingv2.PercentScalingPolicy,
-				Value:         50,
-				PeriodSeconds: 60,
-			},
+			expectedReplicas: 2,
 		},
-	})
-	assert.Equal(t, int32(2), calculated)
+		{
+			// 100 replicas plus MaxInt32 percent of them exceeds int32 and must saturate
+			// rather than wrap.
+			name:            "percent policy overflow saturates to MaxInt32",
+			currentReplicas: 100,
+			selectPolicy:    autoscalingv2.MaxChangePolicySelect,
+			policies: []autoscalingv2.HPAScalingPolicy{
+				{Type: autoscalingv2.PercentScalingPolicy, Value: math.MaxInt32, PeriodSeconds: 60},
+			},
+			expectedReplicas: math.MaxInt32,
+		},
+		{
+			name:            "min policy: overflowing percent policy loses to pods policy",
+			currentReplicas: 100,
+			selectPolicy:    autoscalingv2.MinChangePolicySelect,
+			policies: []autoscalingv2.HPAScalingPolicy{
+				{Type: autoscalingv2.PercentScalingPolicy, Value: math.MaxInt32, PeriodSeconds: 60},
+				{Type: autoscalingv2.PodsScalingPolicy, Value: 10, PeriodSeconds: 60},
+			},
+			expectedReplicas: 110,
+		},
+		{
+			name:            "max policy: overflowing percent policy wins over pods policy",
+			currentReplicas: 100,
+			selectPolicy:    autoscalingv2.MaxChangePolicySelect,
+			policies: []autoscalingv2.HPAScalingPolicy{
+				{Type: autoscalingv2.PercentScalingPolicy, Value: math.MaxInt32, PeriodSeconds: 60},
+				{Type: autoscalingv2.PodsScalingPolicy, Value: 10, PeriodSeconds: 60},
+			},
+			expectedReplicas: math.MaxInt32,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calculated := calculateScaleUpLimitWithScalingRules(tt.currentReplicas, []timestampedScaleEvent{}, []timestampedScaleEvent{}, &autoscalingv2.HPAScalingRules{
+				StabilizationWindowSeconds: new(int32(300)),
+				SelectPolicy:               &tt.selectPolicy,
+				Policies:                   tt.policies,
+			})
+			assert.Equal(t, tt.expectedReplicas, calculated)
+		})
+	}
 }
 
 func TestCalculateScaleDownLimitWithBehaviors(t *testing.T) {
@@ -6913,6 +6986,7 @@ func TestUpdateHPAEnqueueBehavior(t *testing.T) {
 }
 
 func TestUpdateHPAFallsBackWhenFeatureDisabled(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.37"))
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.HPAGeneration, false)
 
 	spy := newSpyWorkQueue(10 * time.Minute)

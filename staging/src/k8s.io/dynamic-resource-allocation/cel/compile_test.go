@@ -139,6 +139,18 @@ var testcases = map[string]struct {
 		expectMatch: true,
 		expectCost:  4,
 	},
+	"conflicting-attribute-names-prefers-fully-qualified": {
+		// "name" and "dra.example.com/name" both resolve to the same key;
+		// the fully-qualified one must win regardless of map order.
+		expression: `device.attributes["dra.example.com"].name == true`,
+		driver:     "dra.example.com",
+		attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			"name":                 {BoolValue: ptr.To(false)},
+			"dra.example.com/name": {BoolValue: ptr.To(true)},
+		},
+		expectMatch: true,
+		expectCost:  5,
+	},
 	"bool": {
 		expression:  `device.attributes["dra.example.com"].name`,
 		attributes:  map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{"name": {BoolValue: ptr.To(true)}},
@@ -449,6 +461,18 @@ var testcases = map[string]struct {
 		expectMatch: true,
 		expectCost:  6,
 	},
+	"conflicting-capacity-names-prefers-fully-qualified": {
+		// "name" and "dra.example.com/name" both resolve to the same key;
+		// the fully-qualified one must win regardless of map order.
+		expression: `device.capacity["dra.example.com"].name.isGreaterThan(quantity("1Ki"))`,
+		driver:     "dra.example.com",
+		capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+			"name":                 {Value: resource.MustParse("0")},
+			"dra.example.com/name": {Value: resource.MustParse("1Mi")},
+		},
+		expectMatch: true,
+		expectCost:  6,
+	},
 	"check-positive": {
 		expression:  `"name" in device.capacity["dra.example.com"] && device.capacity["dra.example.com"].name.isGreaterThan(quantity("1Ki"))`,
 		capacity:    map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{"name": {Value: resource.MustParse("1Mi")}},
@@ -460,6 +484,27 @@ var testcases = map[string]struct {
 		expression:  `!("name" in device.capacity["dra.example.com"]) || device.capacity["dra.example.com"].name.isGreaterThan(quantity("1Ki"))`,
 		expectMatch: true,
 		expectCost:  11,
+	},
+	"quantity-compare-to-dec-then-is-integer": {
+		expression:  `device.capacity["dra.example.com"].memory.compareTo(quantity("1.5Gi")) >= 0 && device.capacity["dra.example.com"].memory.isInteger()`,
+		capacity:    map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{"memory": {Value: resource.MustParse("2Gi")}},
+		driver:      "dra.example.com",
+		expectMatch: true,
+		expectCost:  12,
+	},
+	"quantity-greater-than-dec-then-as-integer": {
+		expression:  `device.capacity["dra.example.com"].memory.isGreaterThan(quantity("1.5Gi")) && device.capacity["dra.example.com"].memory.asInteger() == 2147483648`,
+		capacity:    map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{"memory": {Value: resource.MustParse("2Gi")}},
+		driver:      "dra.example.com",
+		expectMatch: true,
+		expectCost:  12,
+	},
+	"quantity-less-than-dec-then-is-integer": {
+		expression:  `!device.capacity["dra.example.com"].memory.isLessThan(quantity("1.5Gi")) && device.capacity["dra.example.com"].memory.isInteger()`,
+		capacity:    map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{"memory": {Value: resource.MustParse("2Gi")}},
+		driver:      "dra.example.com",
+		expectMatch: true,
+		expectCost:  12,
 	},
 	"all": {
 		expression: `
@@ -1079,6 +1124,21 @@ func TestEvaluateDerivedAttributes(t *testing.T) {
 			expression:      `dyn(null)`,
 			device:          mockDevice,
 			expectEvalError: "unsupported CEL return type: structpb.NullValue",
+		},
+		{
+			// "bool-attr" and "driver-a/bool-attr" both resolve to the
+			// same key; the fully-qualified one must win regardless of
+			// map order.
+			name:       "conflicting-attribute-names-prefers-fully-qualified",
+			expression: `device.attributes["driver-a"]["bool-attr"]`,
+			device: Device{
+				Driver: "driver-a",
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					"bool-attr":          {BoolValue: new(false)},
+					"driver-a/bool-attr": {BoolValue: new(true)},
+				},
+			},
+			expectAttr: &resourceapi.DeviceAttribute{BoolValue: new(true)},
 		},
 	}
 

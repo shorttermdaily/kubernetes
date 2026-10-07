@@ -51,13 +51,13 @@ import (
 	schedulinglisters "k8s.io/client-go/listers/scheduling/v1beta1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	consistencyutil "k8s.io/client-go/util/consistency"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/job/metrics"
 	"k8s.io/kubernetes/pkg/controller/job/util"
-	consistencyutil "k8s.io/kubernetes/pkg/controller/util/consistency"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
@@ -657,6 +657,8 @@ func (jm *Controller) deleteJob(logger klog.Logger, obj interface{}) {
 	jm.enqueueLabelSelector(jobObj)
 
 	key := cache.MetaObjectToName(jobObj).String()
+	// Delete expectations for the Job so a replacement with the same name starts clean.
+	jm.expectations.DeleteExpectations(logger, key)
 	err := jm.podBackoffStore.removeBackoffRecord(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("error removing backoff record %w", err))

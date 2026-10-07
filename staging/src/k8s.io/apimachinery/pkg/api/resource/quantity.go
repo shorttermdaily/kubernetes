@@ -102,6 +102,9 @@ import (
 // writing some sort of special handling code in the hopes that that will
 // cause implementors to also use a fixed point implementation.
 //
+// ---
+// Quantity is a value type. Each shallow copy is independent from its source.
+//
 // +protobuf=true
 // +protobuf.embed=string
 // +protobuf.options.marshal=false
@@ -363,7 +366,9 @@ func ParseQuantity(str string) (Quantity, error) {
 								return Quantity{i: int64Amount{value: result, scale: Scale(scale)}, Format: format, s: str}, nil
 							}
 						}
-						return Quantity{i: int64Amount{value: result, scale: Scale(scale)}, Format: format}, nil
+						q := Quantity{i: int64Amount{value: result, scale: Scale(scale)}, Format: format}
+						q.CacheString()
+						return q, nil
 					}
 				}
 			}
@@ -377,6 +382,11 @@ func ParseQuantity(str string) (Quantity, error) {
 
 	// So that no one but us has to think about suffixes, remove it.
 	if base == 10 {
+		if exponent == math.MinInt32 {
+			// inf.Dec negates the scale to apply it, which this value
+			// cannot survive, so the quantity has no representation here.
+			return Quantity{}, ErrSuffix
+		}
 		amount.SetScale(amount.Scale() + Scale(exponent).infScale())
 	} else if base == 2 {
 		// numericSuffix = 2 ** exponent
@@ -413,11 +423,14 @@ func ParseQuantity(str string) (Quantity, error) {
 		amount.Neg(amount)
 	}
 
-	return Quantity{d: infDecAmount{amount}, Format: format}, nil
+	q := Quantity{d: infDecAmount{amount}, Format: format}
+	q.CacheString()
+	return q, nil
 }
 
 // DeepCopy returns a deep-copy of the Quantity value.  Note that the method
 // receiver is a value, so we can mutate it in-place and return it.
+// Quantity is a value type. Each shallow copy is independent from its source.
 func (q Quantity) DeepCopy() Quantity {
 	if q.d.Dec != nil {
 		tmp := &inf.Dec{}
@@ -532,7 +545,7 @@ func (q *Quantity) AsApproximateFloat64() float64 {
 // value of the quantity is outside the range of a float64 +Inf/-Inf will be
 // returned.
 func (q *Quantity) AsFloat64Slow() float64 {
-	infDec := q.AsDec()
+	infDec := q.internalReadOnlyDec()
 
 	var absScale int64
 	if infDec.Scale() < 0 {
@@ -575,14 +588,23 @@ func (q *Quantity) ToDec() *Quantity {
 	return q
 }
 
-// AsDec returns the quantity as represented by a scaled inf.Dec.
+// AsDec returns the quantity as represented by a scaled inf.Dec. The returned
+// quantity is a copy to avoid accidentally modifying the original.
 func (q *Quantity) AsDec() *inf.Dec {
+	if q.d.Dec != nil {
+		return new(inf.Dec).Set(q.d.Dec)
+	}
+	return q.i.AsDec()
+}
+
+// internalReadOnlyDec is AsDec without the defensive copy. This may only be
+// used internally in the Quantity implementation where we can guarantee the
+// returned value will not be modified.
+func (q *Quantity) internalReadOnlyDec() *inf.Dec {
 	if q.d.Dec != nil {
 		return q.d.Dec
 	}
-	q.d.Dec = q.i.AsDec()
-	q.i = int64Amount{}
-	return q.d.Dec
+	return q.i.AsDec()
 }
 
 // AsCanonicalBytes returns the canonical byte representation of this quantity as a mantissa
@@ -655,7 +677,8 @@ func (q *Quantity) Add(y Quantity) {
 	} else if q.IsZero() {
 		q.Format = y.Format
 	}
-	q.ToDec().d.Dec.Add(q.d.Dec, y.AsDec())
+	q.ToDec()
+	q.d.Dec = new(inf.Dec).Add(q.d.Dec, y.internalReadOnlyDec())
 }
 
 // Sub subtracts the provided quantity from the current value in place. If the current
@@ -676,7 +699,8 @@ func (q *Quantity) Sub(y Quantity) {
 	if q.d.Dec == nil && y.d.Dec == nil && q.i.Sub(y.i) {
 		return
 	}
-	q.ToDec().d.Dec.Sub(q.d.Dec, y.AsDec())
+	q.ToDec()
+	q.d.Dec = new(inf.Dec).Sub(q.d.Dec, y.internalReadOnlyDec())
 }
 
 // Mul multiplies the provided y to the current value.
@@ -686,16 +710,19 @@ func (q *Quantity) Mul(y int64) bool {
 	if q.d.Dec == nil && q.i.Mul(y) {
 		return true
 	}
-	return q.ToDec().d.Dec.Mul(q.d.Dec, inf.NewDec(y, inf.Scale(0))).UnscaledBig().IsInt64()
+	q.ToDec()
+	q.d.Dec = new(inf.Dec).Mul(q.d.Dec, inf.NewDec(y, inf.Scale(0)))
+	return q.d.Dec.UnscaledBig().IsInt64()
 }
 
 // Cmp returns 0 if the quantity is equal to y, -1 if the quantity is less than y, or 1 if the
 // quantity is greater than y.
+// Cmp does not modify q or y.
 func (q *Quantity) Cmp(y Quantity) int {
 	if q.d.Dec == nil && y.d.Dec == nil {
 		return q.i.Cmp(y.i)
 	}
-	return cmpDec(q.AsDec(), y.AsDec())
+	return cmpDec(q.internalReadOnlyDec(), y.internalReadOnlyDec())
 }
 
 // CmpInt64 returns 0 if the quantity is equal to y, -1 if the quantity is less than y, or 1 if the
@@ -719,7 +746,7 @@ func (q *Quantity) Neg() {
 		}
 		q.ToDec()
 	}
-	q.d.Dec.Neg(q.d.Dec)
+	q.d.Dec = new(inf.Dec).Neg(q.d.Dec)
 }
 
 // Equal checks equality of two Quantities. This is useful for testing with
@@ -732,9 +759,14 @@ func (q Quantity) Equal(v Quantity) bool {
 // of most Quantity values.
 const int64QuantityExpectedBytes = 18
 
-// String formats the Quantity as a string, caching the result if not calculated.
-// String is an expensive operation and caching this result significantly reduces the cost of
-// normal parse / marshal operations on Quantity.
+// String formats the Quantity as a string, returning the cached value if it was
+// already calculated.
+//
+// String is an expensive operation which may get called multiple times during
+// encoding, therefore [ParseQuantity] takes care to always cache the string.
+// After constructing a quantity differently or when modifying an existing
+// instance through math operations, [CacheString] can be called to
+// cache the final result at a time when the caller owns the instance.
 func (q *Quantity) String() string {
 	if q == nil {
 		return "<nil>"
@@ -742,9 +774,25 @@ func (q *Quantity) String() string {
 	if len(q.s) == 0 {
 		result := make([]byte, 0, int64QuantityExpectedBytes)
 		number, suffix := q.CanonicalizeBytes(result)
-		number = append(number, suffix...)
-		q.s = string(number)
+		return string(append(number, suffix...))
 	}
+	return q.s
+}
+
+// CacheString formats the Quantity as a string, same as String, but also
+// caches the result on the receiver so that later calls to String don't have
+// to recompute it.
+//
+// May only be called at times when the caller can safely mutate the instance.
+func (q *Quantity) CacheString() string {
+	if q == nil {
+		return "<nil>"
+	}
+	// This intentionally *always* writes the value back:
+	// it's unnecessary when it was already set, but writing anyway
+	// ensures that data races related to calling CacheString
+	// are more likely to be reported, regardless of the state of the instance.
+	q.s = q.String()
 	return q.s
 }
 
@@ -832,7 +880,8 @@ func (q *Quantity) UnmarshalCBOR(value []byte) error {
 // value in the given format.
 func NewDecimalQuantity(b inf.Dec, format Format) *Quantity {
 	return &Quantity{
-		d:      infDecAmount{&b},
+		// b is a shallow copy and shares the big.Int.abs slice from the original, so we make a defensive copy.
+		d:      infDecAmount{new(inf.Dec).Set(&b)},
 		Format: format,
 	}
 }
@@ -897,9 +946,7 @@ func (q *Quantity) AsScaledInt64(scale Scale) (value int64, ok bool) {
 	if q.d.Dec == nil {
 		return q.i.AsScaledInt64(scale)
 	}
-	dec := q.d.Dec
-	// Negate after widening: inf.Scale(-math.MinInt32) overflows back to itself.
-	return scaledValue(dec.UnscaledBig(), int64(dec.Scale()), -int64(scale))
+	return scaledValue(q.d.Dec.UnscaledBig(), q.d.widenedScale(), widenScale(scale))
 }
 
 // AsMilliInt64 returns the value of q*1000 as an int64, rounded away from zero.

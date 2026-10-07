@@ -277,7 +277,6 @@ readonly KUBE_TEST_BINARIES=("${KUBE_TEST_TARGETS[@]##*/}")
 readonly KUBE_TEST_BINARIES_WIN=("${KUBE_TEST_BINARIES[@]/%/.exe}")
 readonly KUBE_TEST_PORTABLE=(
   test/e2e/testing-manifests
-  test/kubemark
   hack/e2e-internal
   hack/get-build.sh
   hack/ginkgo-e2e.sh
@@ -289,7 +288,6 @@ readonly KUBE_TEST_PORTABLE=(
 # These binaries will be distributed in the kubernetes-test tarball.
 kube::golang::server_test_targets() {
   local targets=(
-    cmd/kubemark
     ginkgo
   )
 
@@ -332,7 +330,6 @@ readonly KUBE_STATIC_BINARIES=(
   kubectl
   kubectl-convert
   kubelet
-  kubemark
   mounter
 )
 
@@ -573,7 +570,7 @@ EOF
   local go_version
   IFS=" " read -ra go_version <<< "$(GOFLAGS='' go version)"
   local minimum_go_version
-  minimum_go_version=go1.26
+  minimum_go_version=go1.27
   if [[ "${minimum_go_version}" != $(echo -e "${minimum_go_version}\n${go_version[2]}" | sort -s -t. -k 1,1 -k 2,2n -k 3,3n | head -n1) && "${go_version[2]}" != "devel" ]]; then
     kube::log::usage_from_stdin <<EOF
 Detected go version: ${go_version[*]}.

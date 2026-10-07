@@ -329,7 +329,7 @@ func TestCacheIntervalNextFromWatchCache(t *testing.T) {
 					if i%bufferSize == 0 && i != c.eventsAddedToWatchcache {
 						originalCacheStartIndex := wc.history.startIndex
 						wc.history.startIndex = src.startIndex + 1
-						event, err := wci.Next()
+						event, err := src.next()
 						if err == nil {
 							t.Errorf("expected non-nil error")
 						}
@@ -352,7 +352,7 @@ func TestCacheIntervalNextFromWatchCache(t *testing.T) {
 					return
 				}
 
-				event, err := wci.Next()
+				event, err := src.next()
 				if err != nil {
 					t.Errorf("unexpected error: %v", err)
 					return
@@ -364,7 +364,7 @@ func TestCacheIntervalNextFromWatchCache(t *testing.T) {
 					t.Error(err)
 				}
 			}
-			event, err := wci.Next()
+			event, err := src.next()
 			ok := err != nil
 			if err := verifyNoEvent(ok, event); err != nil {
 				t.Error(err)
@@ -382,7 +382,7 @@ func TestCacheIntervalNextFromStore(t *testing.T) {
 		return labels.Set(pod.Labels), fields.Set{"spec.nodeName": pod.Spec.NodeName}, nil
 	}
 	const numEvents = 50
-	store := store.NewIndexer(nil)
+	store := store.NewWatchCacheStorage(nil)
 	events := make(map[string]*watchCacheEvent)
 	var rv uint64 = 1 // arbitrary number; rv till which the watch cache has progressed.
 
@@ -400,16 +400,19 @@ func TestCacheIntervalNextFromStore(t *testing.T) {
 			Key:             elem.Key,
 			ResourceVersion: rv,
 		}
-		store.Add(elem)
+		if _, err := store.UpdateStore(watch.Added, elem, rv); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	wci, err := newCacheIntervalFromStore(rv, store, "", false)
+	wci, err := newCacheIntervalFromStore(rv, store.LatestSnapshot(), "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	src := wci.source.(*snapshotCacheIntervalSource)
 
 	for i := 0; i < numEvents; i++ {
-		event, err := wci.Next()
+		event, err := src.next()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -427,7 +430,7 @@ func TestCacheIntervalNextFromStore(t *testing.T) {
 	}
 
 	// All events should have been consumed.
-	event, err := wci.Next()
+	event, err := src.next()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -441,9 +444,9 @@ func TestCacheIntervalNextFromStore(t *testing.T) {
 func TestCacheIntervalFromStoreSorted(t *testing.T) {
 	cases := []struct {
 		name    string
-		indexer store.Indexer
+		indexer *store.WatchCacheStorage
 	}{
-		{"btree", store.NewIndexer(nil)},
+		{"btree", store.NewWatchCacheStorage(nil)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -453,20 +456,21 @@ func TestCacheIntervalFromStoreSorted(t *testing.T) {
 			for i := n - 1; i >= 0; i-- {
 				key := fmt.Sprintf("pod-%08d", i)
 				elem := makeTestStoreElement(makeTestPod(key, uint64(i)))
-				err := tc.indexer.Add(elem)
+				_, err := tc.indexer.UpdateStore(watch.Added, elem, uint64(i))
 				if err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			wci, err := newCacheIntervalFromStore(n, tc.indexer, "", false)
+			wci, err := newCacheIntervalFromStore(n, tc.indexer.LatestSnapshot(), "", false)
 			if err != nil {
 				t.Fatal(err)
 			}
+			src := wci.source.(*snapshotCacheIntervalSource)
 
 			got := make([]string, 0, n)
 			for range n {
-				ev, err := wci.Next()
+				ev, err := src.next()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -480,8 +484,7 @@ func TestCacheIntervalFromStoreSorted(t *testing.T) {
 }
 
 // TestCacheIntervalSourceSelection verifies that getIntervalFromStoreLocked builds the
-// interval from the lazy snapshot source when snapshotting is enabled and falls back to the
-// eager snapshot source when it is disabled.
+// interval from the lazy snapshot source regardless of whether snapshotting is enabled.
 func TestCacheIntervalSourceSelection(t *testing.T) {
 	cases := []struct {
 		name             string
@@ -494,9 +497,9 @@ func TestCacheIntervalSourceSelection(t *testing.T) {
 			wantLazySnapshot: true,
 		},
 		{
-			name:             "snapshotting disabled falls back to eager snapshot",
+			name:             "snapshotting disabled still serves from lazy snapshot",
 			snapshottingOn:   false,
-			wantLazySnapshot: false,
+			wantLazySnapshot: true,
 		},
 	}
 	for _, tc := range cases {
@@ -529,8 +532,7 @@ func TestCacheIntervalSourceSelection(t *testing.T) {
 }
 
 type countingSnapshot struct {
-	items                  []interface{}
-	orderedListPrefixCalls int
+	rangePrefixCalls int
 }
 
 func (s *countingSnapshot) GetByKey(string) (interface{}, bool, error) {
@@ -538,30 +540,26 @@ func (s *countingSnapshot) GetByKey(string) (interface{}, bool, error) {
 }
 
 func (s *countingSnapshot) OrderedListPrefix(_, _ string) ([]interface{}, error) {
-	s.orderedListPrefixCalls++
-	return s.items, nil
+	return nil, fmt.Errorf("OrderedListPrefix must not be called")
 }
 
 func (s *countingSnapshot) RangePrefix(_, _ string) store.Range {
-	return nil
+	s.rangePrefixCalls++
+	return store.EmptyRange()
 }
 
-// TestLazySnapshotCacheIntervalSourceEmpty checks that on an empty snapshot Next() returns
-// no events, and that repeated calls still read the snapshot only once.
+func (s *countingSnapshot) ResourceVersion() uint64 {
+	return 0
+}
+
 func TestLazySnapshotCacheIntervalSourceEmpty(t *testing.T) {
 	snap := &countingSnapshot{}
 	wci := newCacheIntervalFromLazySnapshot(100, snap)
 
-	for range 2 {
-		event, err := wci.Next()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if event != nil {
-			t.Errorf("expected nil event from empty snapshot, got %v", *event)
-		}
+	for event, err := range wci.All() {
+		t.Fatalf("empty snapshot yielded (%v, %v)", event, err)
 	}
-	if snap.orderedListPrefixCalls != 1 {
-		t.Errorf("expected OrderedListPrefix to be called once, got %d", snap.orderedListPrefixCalls)
+	if snap.rangePrefixCalls != 1 {
+		t.Errorf("expected RangePrefix to be called once, got %d", snap.rangePrefixCalls)
 	}
 }

@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	draapi "k8s.io/dynamic-resource-allocation/api"
 )
 
 const (
@@ -48,17 +49,33 @@ var (
 	pointThree   = resource.MustParse("300m")
 	pointTwo     = resource.MustParse("200m")
 	pointOne     = resource.MustParse("100m")
+	pointFive    = resource.MustParse("500m")
+
+	onePlusMilli    = resource.MustParse("1.001")
+	onePlusSubMilli = resource.MustParse("1.0000001")
+
+	five          = resource.MustParse("5")
+	ten           = resource.MustParse("10")
+	fifteen       = resource.MustParse("15")
+	negativeOne   = resource.MustParse("-1")
+	oneGi         = resource.MustParse("1Gi")
+	threeGi       = resource.MustParse("3Gi")
+	negativeOneGi = resource.MustParse("-1Gi")
 
 	// tooBigForMilli is a value whose MilliValue() overflows int64 (> MaxInt64/1000).
 	// resource.MustParse uses DecimalSI by default for large integers.
 	tooBigForMilli = resource.MustParse("9224372036854776E3") // ~9.22e21, well above MaxInt64 (9.22e18)
 )
 
+func fullyQualifiedName(domain, id string) draapi.FullyQualifiedName {
+	return draapi.FullyQualifiedName{Domain: domain, Identifier: id}
+}
+
 func deviceConsumedCapacity(deviceID DeviceID) DeviceConsumedCapacity {
-	capaicty := map[resourceapi.QualifiedName]resource.Quantity{
-		capacity0: one,
+	capacity := ConsumedCapacity{
+		fullyQualifiedName(deviceID.Driver.String(), capacity0): new(one),
 	}
-	return NewDeviceConsumedCapacity(deviceID, capaicty)
+	return DeviceConsumedCapacity{DeviceID: deviceID, ConsumedCapacity: capacity}
 }
 
 func TestConsumableCapacity(t *testing.T) {
@@ -68,7 +85,7 @@ func TestConsumableCapacity(t *testing.T) {
 		allocatedCapacity := NewConsumedCapacity()
 		g.Expect(allocatedCapacity.Empty()).To(BeTrueBecause("allocated capacity should start from zero"))
 		oneAllocated := ConsumedCapacity{
-			capacity0: &one,
+			fullyQualifiedName(driverA, capacity0): &one,
 		}
 		allocatedCapacity.Add(oneAllocated)
 		g.Expect(allocatedCapacity.Empty()).To(BeFalseBecause("capacity is added"))
@@ -84,19 +101,17 @@ func TestConsumableCapacity(t *testing.T) {
 		aggregatedCapacity.Insert(deviceConsumedCapacity(deviceID))
 		allocatedCapacity, found := aggregatedCapacity[deviceID]
 		g.Expect(found).To(BeTrueBecause("expected deviceID to be found"))
-		g.Expect(allocatedCapacity[capacity0].Cmp(two)).To(BeZero())
+		g.Expect(allocatedCapacity[fullyQualifiedName(driverA, capacity0)].Cmp(two)).To(BeZero())
 		aggregatedCapacity.Remove(deviceConsumedCapacity(deviceID))
-		g.Expect(allocatedCapacity[capacity0].Cmp(one)).To(BeZero())
+		g.Expect(allocatedCapacity[fullyQualifiedName(driverA, capacity0)].Cmp(one)).To(BeZero())
 	})
 
 	t.Run("get-consumed-capacity-from-request", func(t *testing.T) {
-		requestedCapacity := &resourceapi.CapacityRequirements{
-			Requests: map[resourceapi.QualifiedName]resource.Quantity{
-				capacity0: one,
-				"dummy":   one,
-			},
+		requestedCapacity := map[draapi.FullyQualifiedName]resource.Quantity{
+			draapi.MakeFullyQualifiedName(capacity0, driverA): one,
+			draapi.MakeFullyQualifiedName("dummy", driverA):   one,
 		}
-		consumableCapacity := map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+		capacity := map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
 			capacity0: { // with request and with default, expect requested value
 				Value: two,
 				RequestPolicy: &resourceapi.CapacityRequestPolicy{
@@ -115,12 +130,21 @@ func TestConsumableCapacity(t *testing.T) {
 				Value: one, // no request and no policy (no default), expect capacity value
 			},
 		}
+		device := deviceWithID{
+			Device: &draapi.Device{
+				Capacity: capacity,
+			},
+			id: DeviceID{
+				Driver: draapi.MakeUniqueString(driverA),
+			},
+		}
 		g := NewWithT(t)
-		consumedCapacity, err := GetConsumedCapacityFromRequest(requestedCapacity, consumableCapacity, false)
+		consumedCapacity, err := getConsumedCapacityFromRequest(requestedCapacity, device, false)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(consumedCapacity).To(HaveLen(3))
 		for name, val := range consumedCapacity {
-			g.Expect(string(name)).Should(BeElementOf([]string{capacity0, capacity1, "dummy"}))
+			g.Expect(name.Domain).To(Equal(driverA), "domain should be omitted since it equals the driver")
+			g.Expect(name.Identifier).Should(BeElementOf([]string{capacity0, capacity1, "dummy"}))
 			g.Expect(val.Cmp(one)).To(BeZero())
 		}
 	})
@@ -151,6 +175,14 @@ func testCmpRequestOverCapacityFatalBeatsSoft(t *testing.T) {
 			},
 		},
 	}
+	device := deviceWithID{
+		Device: &draapi.Device{
+			Capacity: capacity,
+		},
+		id: DeviceID{
+			Driver: draapi.MakeUniqueString(driverA),
+		},
+	}
 	request := &resourceapi.CapacityRequirements{
 		Requests: map[resourceapi.QualifiedName]resource.Quantity{
 			capacity0: two,       // over capacity0's value of 1: soft, skip this device
@@ -160,7 +192,7 @@ func testCmpRequestOverCapacityFatalBeatsSoft(t *testing.T) {
 	// Go's map order is unspecified, so run the check repeatedly to make an
 	// order-dependent regression very likely to surface rather than to rely on one order.
 	for range 64 {
-		ok, err := CmpRequestOverCapacity(NewConsumedCapacity(), request, nil, capacity, NewConsumedCapacity(), false)
+		_, ok, err := cmpRequestOverCapacity(NewConsumedCapacity(), request, device, NewConsumedCapacity(), false)
 		g.Expect(ok).To(BeFalseBecause("an unrepresentable request must not be considered satisfiable"))
 		g.Expect(err).To(MatchError(errCapacityRequestNotRepresentable), "a representability error must take precedence over the soft over-capacity mismatch")
 	}
@@ -352,6 +384,7 @@ func testCalculateConsumedCapacity(t *testing.T) {
 		fractionalCapacityRange bool
 		expectResult            resource.Quantity
 		expectErr               bool
+		expectErrMessage        string
 	}{
 		"empty": {requestedVal: nil, capacityValue: one, requestPolicy: &resourceapi.CapacityRequestPolicy{}, expectResult: one},
 		// A request above MaxInt64 cannot be read with Value() without wrapping, so
@@ -445,6 +478,87 @@ func testCalculateConsumedCapacity(t *testing.T) {
 			fractionalCapacityRange: true,
 			expectResult:            resource.MustParse("400m"),
 		},
+		// TODO(#141166): An in-range sub-milli request must round up to the next step, here 2, instead of failing.
+		"integer-step-sub-milli-request": {
+			requestedVal:            &onePlusSubMilli,
+			capacityValue:           three,
+			requestPolicy:           &resourceapi.CapacityRequestPolicy{Default: &one, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &one, Step: &one}},
+			fractionalCapacityRange: true,
+			expectErr:               true,
+		},
+		"integer-step-milli-request-rounds-up": {
+			requestedVal:            &onePlusMilli,
+			capacityValue:           three,
+			requestPolicy:           &resourceapi.CapacityRequestPolicy{Default: &one, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &one, Step: &one}},
+			fractionalCapacityRange: true,
+			expectResult:            two,
+		},
+		"integer-step-sub-milli-request-rounds-up-without-fractional-range": {
+			requestedVal:  &onePlusSubMilli,
+			capacityValue: three,
+			requestPolicy: &resourceapi.CapacityRequestPolicy{Default: &one, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &one, Step: &one}},
+			expectResult:  two,
+		},
+		// TODO(#141166): An in-range sub-milli request must round up to the next step, here 1.5, instead of failing.
+		"fractional-step-sub-milli-request": {
+			requestedVal:            &onePlusSubMilli,
+			capacityValue:           two,
+			requestPolicy:           &resourceapi.CapacityRequestPolicy{Default: &pointFive, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &pointFive, Step: &pointFive}},
+			fractionalCapacityRange: true,
+			expectErr:               true,
+		},
+		"fractional-step-milli-request-rounds-up": {
+			requestedVal:            &onePlusMilli,
+			capacityValue:           two,
+			requestPolicy:           &resourceapi.CapacityRequestPolicy{Default: &pointFive, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &pointFive, Step: &pointFive}},
+			fractionalCapacityRange: true,
+			expectResult:            resource.MustParse("1500m"),
+		},
+		// TODO(#141166): A non-positive step must fail with a message about the step, not the MaxInt64 overflow message.
+		"negative-step-request-above-min-is-rejected": {
+			requestedVal:     &fifteen,
+			capacityValue:    fifteen,
+			requestPolicy:    &resourceapi.CapacityRequestPolicy{Default: &ten, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &ten, Step: &negativeOne}},
+			expectErr:        true,
+			expectErrMessage: "rounding request 15 up to the next step passes MaxInt64",
+		},
+		// TODO(#141166): A non-positive step must fail with a message about the step, not the MaxInt64 overflow message.
+		"negative-step-request-above-min-is-rejected-with-fractional-range": {
+			requestedVal:            &fifteen,
+			capacityValue:           fifteen,
+			requestPolicy:           &resourceapi.CapacityRequestPolicy{Default: &ten, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &ten, Step: &negativeOne}},
+			fractionalCapacityRange: true,
+			expectErr:               true,
+			expectErrMessage:        "rounding request 15 up to the next step passes MaxInt64",
+		},
+		// TODO(#141166): A non-positive step must fail with a message about the step, not the MaxInt64 overflow message.
+		"negative-step-request-equal-to-min-is-rejected": {
+			requestedVal:     &ten,
+			capacityValue:    fifteen,
+			requestPolicy:    &resourceapi.CapacityRequestPolicy{Default: &ten, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &ten, Step: &negativeOne}},
+			expectErr:        true,
+			expectErrMessage: "rounding request 10 up to the next step passes MaxInt64",
+		},
+		"negative-step-request-below-min-returns-min": {
+			requestedVal:  &five,
+			capacityValue: fifteen,
+			requestPolicy: &resourceapi.CapacityRequestPolicy{Default: &ten, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &ten, Step: &negativeOne}},
+			expectResult:  ten,
+		},
+		// TODO(#141166): A non-positive step must fail with a message about the step, not the MaxInt64 overflow message.
+		"negative-binary-step-request-above-min-is-rejected": {
+			requestedVal:     &threeGi,
+			capacityValue:    threeGi,
+			requestPolicy:    &resourceapi.CapacityRequestPolicy{Default: &oneGi, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &oneGi, Step: &negativeOneGi}},
+			expectErr:        true,
+			expectErrMessage: "rounding request 3Gi up to the next step passes MaxInt64",
+		},
+		"positive-binary-step-request-above-min-rounds-to-itself": {
+			requestedVal:  &threeGi,
+			capacityValue: threeGi,
+			requestPolicy: &resourceapi.CapacityRequestPolicy{Default: &oneGi, ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &oneGi, Step: &oneGi}},
+			expectResult:  threeGi,
+		},
 		"valid value in set": {
 			requestedVal:  &two,
 			capacityValue: three,
@@ -480,6 +594,11 @@ func testCalculateConsumedCapacity(t *testing.T) {
 		},
 		// A milli-representable request whose rounded value passes the milli-value range is
 		// rejected with a fatal error rather than silently capped.
+		// min=100m, step=100m, request=MaxInt64-1 milli:
+		//   added = MaxInt64-1 - 100 = MaxInt64-101
+		//   n     = (MaxInt64-101) / 100 = 92233720368547757  (added%100 == 6, so n++)
+		//   n     = 92233720368547758
+		//   guard = (MaxInt64-100)/100 = 92233720368547757  → n > guard → not representable
 		"fractional-step-rounded-value-passes-milli-range-is-rejected": {
 			requestedVal: func() *resource.Quantity {
 				q := resource.NewMilliQuantity(math.MaxInt64-1, resource.DecimalSI)
@@ -507,6 +626,9 @@ func testCalculateConsumedCapacity(t *testing.T) {
 			consumedCapacity, err := calculateConsumedCapacity(tc.requestedVal, capacity, tc.fractionalCapacityRange)
 			if tc.expectErr {
 				g.Expect(err).To(MatchError(errCapacityRequestNotRepresentable))
+				if tc.expectErrMessage != "" {
+					g.Expect(err).To(MatchError(ContainSubstring(tc.expectErrMessage)))
+				}
 			} else {
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(consumedCapacity.Cmp(tc.expectResult)).To(BeZero())

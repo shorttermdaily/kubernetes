@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -59,6 +60,7 @@ import (
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/network/dns"
+	"k8s.io/kubernetes/pkg/kubelet/prober"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/secret"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -157,7 +159,7 @@ fe00::2	ip6-allrouters
 			hostsFileName: "hosts_test_file2_with_host_aliases",
 			hostAliases: []v1.HostAlias{
 				{IP: "123.45.67.89", Hostnames: []string{"foo", "bar", "baz"}},
-				{IP: "456.78.90.123", Hostnames: []string{"park", "doo", "boo"}},
+				{IP: "45.67.89.123", Hostnames: []string{"park", "doo", "boo"}},
 			},
 			rawHostsFileContent: `# another hosts file for testing.
 127.0.0.1	localhost
@@ -180,7 +182,7 @@ fe00::2	ip6-allrouters
 
 # Entries added by HostAliases.
 123.45.67.89	foo	bar	baz
-456.78.90.123	park	doo	boo
+45.67.89.123	park	doo	boo
 `,
 		},
 	}
@@ -271,7 +273,7 @@ fe00::2	ip6-allrouters
 			hostDomainName: "domainFoo",
 			hostAliases: []v1.HostAlias{
 				{IP: "123.45.67.89", Hostnames: []string{"foo", "bar", "baz"}},
-				{IP: "456.78.90.123", Hostnames: []string{"park", "doo", "boo"}},
+				{IP: "45.67.89.123", Hostnames: []string{"park", "doo", "boo"}},
 			},
 			expectedContent: `# Kubernetes-managed hosts file.
 127.0.0.1	localhost
@@ -284,7 +286,7 @@ fe00::2	ip6-allrouters
 
 # Entries added by HostAliases.
 123.45.67.89	foo	bar	baz
-456.78.90.123	park	doo	boo
+45.67.89.123	park	doo	boo
 `,
 		},
 		{
@@ -5880,6 +5882,149 @@ func Test_generateAPIPodStatus(t *testing.T) {
 	}
 }
 
+// Test_generateAPIPodStatusOnKubeletRestart verifies that a new container does not inherit
+// the readiness the API server still reports for the container it replaced. Readiness is
+// preserved across a kubelet restart only when the container the kubelet last observed from
+// the API server is the one the runtime reports.
+//
+// An e2e test could restart the kubelet, but it could not reliably create the stale API
+// server status this depends on. That status appears only when the container is replaced
+// while the kubelet cannot update the API server. An e2e test would have to race the
+// runtime or write the pod status behind the kubelet's back. This test instead builds the
+// same situation from an empty status manager cache and a CRI status whose container
+// differs from the one the pod status still reports.
+//
+// See https://github.com/kubernetes/kubernetes/issues/141473
+func Test_generateAPIPodStatusOnKubeletRestart(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ChangeContainerStatusOnKubeletRestart, false)
+
+	const containerName = "containerA"
+	oldContainerID := kubecontainer.ContainerID{Type: "test", ID: "old_container_id"}
+	newContainerID := kubecontainer.ContainerID{Type: "test", ID: "new_container_id"}
+
+	tests := []struct {
+		name string
+		// apiContainerID is the container ID in the pod status the kubelet last
+		// observed from the API server, which may be outdated.
+		apiContainerID               kubecontainer.ContainerID
+		firstSyncAfterKubeletRestart bool
+		expectedReady                bool
+	}{
+		{
+			name:                         "the same container survived the kubelet restart, first sync",
+			apiContainerID:               newContainerID,
+			firstSyncAfterKubeletRestart: true,
+			expectedReady:                true,
+		},
+		{
+			name:           "the same container survived the kubelet restart",
+			apiContainerID: newContainerID,
+			expectedReady:  true,
+		},
+		{
+			name:                         "a new container was created while the API server was unreachable, first sync",
+			apiContainerID:               oldContainerID,
+			firstSyncAfterKubeletRestart: true,
+			expectedReady:                false,
+		},
+		{
+			name:           "a new container was created while the API server was unreachable",
+			apiContainerID: oldContainerID,
+			expectedReady:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, tCtx := ktesting.NewTestContext(t)
+
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			defer testKubelet.Cleanup()
+			kl := testKubelet.kubelet
+
+			// newTestKubelet installs a fake probe manager.
+			// Use the real one so that the readiness preservation logic runs.
+			kl.probeManager = prober.NewManager(
+				kl.statusManager,
+				kl.livenessManager,
+				kl.readinessManager,
+				kl.startupManager,
+				kl.runner,
+				&record.FakeRecorder{},
+			)
+
+			// The pod as the kubelet last observed it from the API server. The status
+			// manager cache is empty after a kubelet restart, so generateAPIPodStatus
+			// falls back to this as the previous status.
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID:       "12345678",
+					Name:      "probe-state-preservation",
+					Namespace: "foo",
+				},
+				Spec: v1.PodSpec{
+					NodeName:      "machine",
+					RestartPolicy: v1.RestartPolicyAlways,
+					Containers: []v1.Container{{
+						Name: containerName,
+						ReadinessProbe: &v1.Probe{
+							ProbeHandler:        v1.ProbeHandler{Exec: &v1.ExecAction{}},
+							InitialDelaySeconds: 3600,
+							PeriodSeconds:       1,
+						},
+					}},
+				},
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					Conditions: []v1.PodCondition{{
+						Type:   v1.PodReady,
+						Status: v1.ConditionTrue,
+					}},
+					ContainerStatuses: []v1.ContainerStatus{{
+						Name:        containerName,
+						ContainerID: tc.apiContainerID.String(),
+						State:       v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+						Ready:       true,
+					}},
+				},
+			}
+
+			// On the first sync after a kubelet restart there is no readiness worker yet,
+			// because SyncPod calls generateAPIPodStatus before probeManager.AddPod.
+			if !tc.firstSyncAfterKubeletRestart {
+				kl.probeManager.AddPod(tCtx, pod)
+				t.Cleanup(func() { kl.probeManager.RemovePod(pod) })
+			}
+
+			// The runtime reports a container that started long before the kubelet, so
+			// its start time alone makes it look like a container that survived the
+			// restart.
+			criStatus := &kubecontainer.PodStatus{
+				ID:        pod.UID,
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				SandboxStatuses: []*runtimeapi.PodSandboxStatus{{
+					Metadata: &runtimeapi.PodSandboxMetadata{Attempt: uint32(0)},
+					State:    runtimeapi.PodSandboxState_SANDBOX_READY,
+				}},
+				ContainerStatuses: []*kubecontainer.Status{{
+					Name:      containerName,
+					ID:        newContainerID,
+					State:     kubecontainer.ContainerStateRunning,
+					StartedAt: time.Now().Add(-time.Hour),
+				}},
+			}
+
+			actual := kl.generateAPIPodStatus(tCtx, pod, criStatus, false /* podIsTerminal */)
+
+			require.Len(t, actual.ContainerStatuses, 1)
+			cStatus := actual.ContainerStatuses[0]
+			require.Equal(t, newContainerID.String(), cStatus.ContainerID, "the generated status should report the container the runtime runs")
+			assert.Equal(t, tc.expectedReady, cStatus.Ready, "unexpected readiness for container %q", containerName)
+		})
+	}
+}
+
 func Test_generateAPIPodStatusForInPlaceVPAEnabled(t *testing.T) {
 	if goruntime.GOOS != "linux" {
 		t.Skip("InPlacePodVerticalScaling cgroup resource reporting is only supported on Linux")
@@ -8763,6 +8908,39 @@ func TestGetentUserExists(t *testing.T) {
 			if found != tc.wantFound {
 				t.Errorf("%s: got found=%v, want %v", tc.name, found, tc.wantFound)
 			}
+		})
+	}
+}
+
+func TestDefaultKubeletMappings(t *testing.T) {
+	tests := []struct {
+		name         string
+		idsPerPod    uint32
+		wantFirstID  uint32
+		wantRangeLen uint32
+	}{
+		{
+			name:         "default idsPerPod",
+			idsPerPod:    65536,
+			wantFirstID:  65536,
+			wantRangeLen: (1 << 32) - 2*65536,
+		},
+		{
+			name:         "custom idsPerPod",
+			idsPerPod:    65536 * 16,
+			wantFirstID:  65536 * 16,
+			wantRangeLen: (1 << 32) - 2*65536*16,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotFirstID, gotRangeLen := defaultKubeletMappings(tc.idsPerPod)
+			assert.Equal(t, tc.wantFirstID, gotFirstID)
+			assert.Equal(t, tc.wantRangeLen, gotRangeLen)
+			// The last ID of the range must stay below 2^32-1, which the kernel
+			// treats as an invalid ID.
+			assert.Less(t, uint64(gotFirstID)+uint64(gotRangeLen)-1, uint64(math.MaxUint32))
 		})
 	}
 }
